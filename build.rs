@@ -51,10 +51,7 @@ fn main() {
         panic!("bun build did not produce {}", bundle.display());
     }
 
-    // Gzip the bundle so it's embedded compressed (~4-5x smaller). It's served
-    // with `Content-Encoding: gzip`, so the browser decompresses it — no runtime
-    // cost on the Rust side, and the binary shrinks accordingly. The minified
-    // JS is mostly repetitive grammar text, so it compresses very well.
+    // Gzip the bundle so it's embedded compressed
     let js = std::fs::read(&bundle).expect("read app.js");
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(&js).expect("gzip app.js");
