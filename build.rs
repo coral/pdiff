@@ -1,5 +1,9 @@
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 // Build the browser bundle with Bun before compiling the crate. The resulting
 // single-file IIFE (web/dist/app.js) is embedded into the binary via
@@ -46,6 +50,17 @@ fn main() {
     if !bundle.exists() {
         panic!("bun build did not produce {}", bundle.display());
     }
+
+    // Gzip the bundle so it's embedded compressed (~4-5x smaller). It's served
+    // with `Content-Encoding: gzip`, so the browser decompresses it — no runtime
+    // cost on the Rust side, and the binary shrinks accordingly. The minified
+    // JS is mostly repetitive grammar text, so it compresses very well.
+    let js = std::fs::read(&bundle).expect("read app.js");
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&js).expect("gzip app.js");
+    let gz = encoder.finish().expect("finish gzip");
+    let gz_path = web_dir.join("dist").join("app.js.gz");
+    std::fs::write(&gz_path, &gz).expect("write app.js.gz");
 }
 
 fn which_bun() -> String {

@@ -9,7 +9,9 @@ use tiny_http::{Header, Response, Server};
 
 /// The browser bundle (single IIFE with every Shiki grammar inlined) and the
 /// page shell, both produced by `build.rs` via Bun and embedded at compile time.
-const APP_JS: &str = include_str!("../web/dist/app.js");
+/// The bundle is embedded gzip-compressed and served with `Content-Encoding:
+/// gzip` (the browser decompresses it), keeping the binary small.
+const APP_JS_GZ: &[u8] = include_bytes!("../web/dist/app.js.gz");
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
 /// Seconds to wait for the browser's readiness beacon before giving up, so the
@@ -95,15 +97,18 @@ fn run(args: Args) -> Result<(), String> {
 
     let html_header = header("Content-Type", "text/html; charset=utf-8");
     let js_header = header("Content-Type", "text/javascript; charset=utf-8");
+    let gzip_header = header("Content-Encoding", "gzip");
 
     for request in server.incoming_requests() {
         // Strip any query string before matching the path.
         let path = request.url().split('?').next().unwrap_or("/");
         let result = match path {
             "/" => request.respond(Response::from_string(&html).with_header(html_header.clone())),
-            "/app.js" => {
-                request.respond(Response::from_string(APP_JS).with_header(js_header.clone()))
-            }
+            "/app.js" => request.respond(
+                Response::from_data(APP_JS_GZ)
+                    .with_header(js_header.clone())
+                    .with_header(gzip_header.clone()),
+            ),
             "/__ready" => {
                 // The browser has everything and has rendered; ack and stop.
                 let _ = request.respond(Response::empty(204));
