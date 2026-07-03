@@ -1,5 +1,5 @@
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::Path;
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::Duration;
 
@@ -18,14 +18,27 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 /// CLI can never hang forever if something goes wrong client-side.
 const WATCHDOG_SECS: u64 = 60;
 
-/// Render a diff of two files in your browser using @pierre/diffs.
+/// Render a diff in your browser using @pierre/diffs.
+///
+/// The mode is auto-detected: exactly two existing files is file mode (the two
+/// files are diffed against each other); anything else — a revision range, a
+/// single ref, --staged, a `--` pathspec, or no arguments at all — is passed
+/// straight through to `git diff`.
+///
+/// pdiff's own options must come before the diff arguments, since everything
+/// after the first positional argument is forwarded verbatim to `git diff`.
 #[derive(Parser)]
-#[command(name = "pdiff", version, about, long_about = None)]
+#[command(
+    name = "pdiff",
+    version,
+    after_help = "\
+EXAMPLES:
+  pdiff old.rs new.rs        Diff two files
+  pdiff HEAD~..HEAD -- src   Diff a commit range, limited to src/
+  pdiff --staged             Diff staged changes
+  pdiff --wrap abc123 def456 Diff two commits, wrapping long lines"
+)]
 struct Args {
-    /// Original ("before") file shown on the left side of the diff
-    old: PathBuf,
-    /// Updated ("after") file shown on the right side of the diff
-    new: PathBuf,
     /// Port to bind on 127.0.0.1 (default: a random free port)
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -35,6 +48,9 @@ struct Args {
     /// Wrap long lines instead of scrolling them horizontally
     #[arg(long)]
     wrap: bool,
+    /// Two files to diff, or arguments forwarded verbatim to `git diff`
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    spec: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -43,11 +59,23 @@ struct FilePayload {
     contents: String,
 }
 
+/// What gets injected into the page. The `mode` tag tells the client whether to
+/// diff two raw files itself or to parse a ready-made git patch.
 #[derive(Serialize)]
-struct Payload {
-    old: FilePayload,
-    new: FilePayload,
-    wrap: bool,
+#[serde(tag = "mode", rename_all = "lowercase")]
+enum Payload {
+    Files {
+        old: FilePayload,
+        new: FilePayload,
+        wrap: bool,
+    },
+    Git {
+        /// Raw `git diff` output; the client parses it with `parsePatchFiles`.
+        patch: String,
+        /// Human-readable description of the diff (used in the page title).
+        title: String,
+        wrap: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -61,15 +89,57 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<(), String> {
-    let old = read_file(&args.old)?;
-    let new = read_file(&args.new)?;
+/// How the spec is interpreted, decided once up front.
+enum Mode<'a> {
+    /// Diff two raw files against each other (left = old, right = new).
+    Files { old: &'a str, new: &'a str },
+    /// Pass the spec straight through to `git diff`.
+    Git,
+}
 
-    let payload = Payload {
-        old,
-        new,
-        wrap: args.wrap,
+/// File mode applies only when the spec is exactly two existing files with no
+/// `--` separator; everything else is treated as a git diff. Binding the two
+/// paths into the `Files` variant keeps the "exactly two files" invariant and
+/// the paths together, so callers never re-index the spec.
+fn detect_mode(spec: &[String]) -> Mode<'_> {
+    if let [old, new] = spec
+        && old != "--"
+        && new != "--"
+        && Path::new(old).is_file()
+        && Path::new(new).is_file()
+    {
+        return Mode::Files { old, new };
+    }
+    Mode::Git
+}
+
+fn run(args: Args) -> Result<(), String> {
+    let (payload, label) = match detect_mode(&args.spec) {
+        Mode::Files { old, new } => {
+            let label = format!("{old} \u{2192} {new}");
+            (
+                Payload::Files {
+                    old: read_file(Path::new(old))?,
+                    new: read_file(Path::new(new))?,
+                    wrap: args.wrap,
+                },
+                label,
+            )
+        }
+        Mode::Git => {
+            let (patch, title) = git_diff(&args.spec)?;
+            let label = title.clone();
+            (
+                Payload::Git {
+                    patch,
+                    title,
+                    wrap: args.wrap,
+                },
+                label,
+            )
+        }
     };
+
     let html = render_page(&payload)?;
 
     let server = Server::http(("127.0.0.1", args.port))
@@ -81,7 +151,7 @@ fn run(args: Args) -> Result<(), String> {
         .ok_or("could not determine bound port")?;
     let url = format!("http://127.0.0.1:{port}/");
 
-    eprintln!("pdiff: serving {} \u{2192} {} at {url}", args.old.display(), args.new.display());
+    eprintln!("pdiff: serving {label} at {url}");
 
     // Safety net: exit even if the browser never reports back.
     thread::spawn(|| {
@@ -124,7 +194,7 @@ fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-fn read_file(path: &PathBuf) -> Result<FilePayload, String> {
+fn read_file(path: &Path) -> Result<FilePayload, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     Ok(FilePayload {
@@ -133,6 +203,34 @@ fn read_file(path: &PathBuf) -> Result<FilePayload, String> {
         name: path.display().to_string(),
         contents,
     })
+}
+
+/// Run `git diff <spec>` verbatim and return its patch plus a label. `--no-color`
+/// keeps ANSI codes out of the patch in case the user's git config forces color.
+fn git_diff(spec: &[String]) -> Result<(String, String), String> {
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--no-color")
+        .args(spec)
+        .output()
+        .map_err(|e| format!("failed to run git (is it installed and on PATH?): {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            return Err(format!("git diff exited with {}", output.status));
+        }
+        return Err(format!("git diff failed: {stderr}"));
+    }
+
+    let patch = String::from_utf8_lossy(&output.stdout).into_owned();
+    let title = if spec.is_empty() {
+        "git diff".to_string()
+    } else {
+        format!("git diff {}", spec.join(" "))
+    };
+    Ok((patch, title))
 }
 
 /// Inject the payload into the HTML shell. The JSON is embedded directly as a JS

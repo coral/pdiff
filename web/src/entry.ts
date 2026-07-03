@@ -2,6 +2,7 @@ import {
   CodeView,
   type CodeViewItem,
   parseDiffFromFile,
+  parsePatchFiles,
 } from '@pierre/diffs';
 
 interface FilePayload {
@@ -9,11 +10,11 @@ interface FilePayload {
   contents: string;
 }
 
-interface PdiffPayload {
-  old: FilePayload;
-  new: FilePayload;
-  wrap: boolean;
-}
+// Mirrors the `Payload` enum in src/main.rs (serde tag = "mode"). File mode
+// ships two raw files we diff here; git mode ships a ready-made patch string.
+type PdiffPayload =
+  | { mode: 'files'; old: FilePayload; new: FilePayload; wrap: boolean }
+  | { mode: 'git'; patch: string; title: string; wrap: boolean };
 
 declare global {
   interface Window {
@@ -30,6 +31,13 @@ function fail(message: string): never {
   // Even on failure, let the CLI know it can stop waiting and exit.
   signalReady();
   throw new Error(message);
+}
+
+// Compile-time exhaustiveness guard. If a new variant is added to PdiffPayload
+// and a `switch (data.mode)` doesn't handle it, `data` is no longer narrowed to
+// `never` here and the call fails to type-check.
+function assertNever(value: never): never {
+  fail(`pdiff: unhandled payload mode: ${JSON.stringify(value)}`);
 }
 
 let readySent = false;
@@ -52,6 +60,52 @@ function signalReady(): void {
   }
   // keepalive so the request survives even if the page is navigating/closing.
   void fetch('/__ready', { method: 'POST', keepalive: true }).catch(() => {});
+}
+
+// File mode: diff the two raw file contents here. parseDiffFromFile runs jsdiff
+// (createTwoFilesPatch) internally and returns FileDiffMetadata, which CodeView
+// renders. It throws on degenerate input, so surface a clean message instead of
+// a blank page (and still let the CLI exit).
+function fileItems(
+  data: Extract<PdiffPayload, { mode: 'files' }>
+): CodeViewItem[] {
+  if (data.old.contents === data.new.contents) {
+    fail(`Files are identical — nothing to diff.\n\n${data.old.name}\n${data.new.name}`);
+  }
+  let fileDiff;
+  try {
+    fileDiff = parseDiffFromFile(
+      { name: data.old.name, contents: data.old.contents },
+      { name: data.new.name, contents: data.new.contents }
+    );
+  } catch (err) {
+    fail(`Could not diff the files: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return [{ id: `diff:${data.new.name}`, type: 'diff', fileDiff }];
+}
+
+// Git mode: parse the raw `git diff` patch into per-file metadata. A single
+// patch can hold many files; each becomes its own diff item.
+function gitItems(
+  data: Extract<PdiffPayload, { mode: 'git' }>
+): CodeViewItem[] {
+  let patches;
+  try {
+    patches = parsePatchFiles(data.patch);
+  } catch (err) {
+    fail(`Could not parse the git diff: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const items: CodeViewItem[] = patches.flatMap((patch, pi) =>
+    patch.files.map((fileDiff, fi) => ({
+      id: `diff:${pi}:${fi}:${fileDiff.name}`,
+      type: 'diff' as const,
+      fileDiff,
+    }))
+  );
+  if (items.length === 0) {
+    fail(`No changes — nothing to diff.\n\n${data.title}`);
+  }
+  return items;
 }
 
 function main(): void {
@@ -85,34 +139,20 @@ function main(): void {
   });
   viewer.setup(root);
 
-  if (data.old.contents === data.new.contents) {
-    fail(`Files are identical — nothing to diff.\n\n${data.old.name}\n${data.new.name}`);
+  let items: CodeViewItem[];
+  switch (data.mode) {
+    case 'files':
+      items = fileItems(data);
+      document.title = `${data.old.name} → ${data.new.name} — pdiff`;
+      break;
+    case 'git':
+      items = gitItems(data);
+      document.title = `${data.title} — pdiff`;
+      break;
+    default:
+      assertNever(data);
   }
-
-  // parseDiffFromFile diffs the two raw file contents internally (jsdiff
-  // createTwoFilesPatch) and returns FileDiffMetadata, which CodeView renders.
-  // It throws on degenerate input, so surface a clean message instead of a
-  // blank page (and still let the CLI exit).
-  let fileDiff;
-  try {
-    fileDiff = parseDiffFromFile(
-      { name: data.old.name, contents: data.old.contents },
-      { name: data.new.name, contents: data.new.contents }
-    );
-  } catch (err) {
-    fail(`Could not diff the files: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  const items: CodeViewItem[] = [
-    {
-      id: `diff:${data.new.name}`,
-      type: 'diff',
-      fileDiff,
-    },
-  ];
   viewer.setItems(items);
-
-  document.title = `${data.old.name} → ${data.new.name} — pdiff`;
 
   // Fallbacks in case onPostRender's 'mount' phase never fires: signal once the
   // window has loaded, and again after a short grace period no matter what.

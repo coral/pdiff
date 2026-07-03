@@ -2,7 +2,7 @@
 name = "pdiff"
 version = "0.1.0"
 edition = "2024"
-description = "Render a diff of two files in your browser using @pierre/diffs"
+description = "Render a diff in your browser using @pierre/diffs"
 license = "MIT"
 
 [[bin]]
